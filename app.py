@@ -3,6 +3,7 @@
 通知表所見ドラフト作成アプリ（Streamlit + Claude API）
 実行: pip install streamlit anthropic && streamlit run app.py
 """
+import hmac
 import json
 import re
 from datetime import datetime
@@ -191,6 +192,33 @@ def autosave():
         streamlit_js_eval(js_expressions=ss["ls_expr"], key=ss["ls_wkey"])
 
 
+def get_secret(name: str) -> str:
+    """Streamlit の Secrets から値を取得（未設定なら空文字）。"""
+    try:
+        return str(st.secrets[name]).strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def resolve_api_key() -> str:
+    """Secrets に登録されたキーを優先し、なければサイドバーの入力値を使う。"""
+    return get_secret("ANTHROPIC_API_KEY") or st.session_state.get("api_key", "").strip()
+
+
+# 任意：Secrets に APP_PASSWORD を設定すると、アプリ起動時にパスワードを求めます
+_app_pw = get_secret("APP_PASSWORD")
+if _app_pw and not st.session_state.get("authed"):
+    st.title("📝 通知表 所見ドラフト作成")
+    with st.form("login"):
+        _pw = st.text_input("パスワード", type="password")
+        if st.form_submit_button("入る"):
+            if hmac.compare_digest(_pw.encode("utf-8"), _app_pw.encode("utf-8")):
+                st.session_state["authed"] = True
+                st.rerun()
+            else:
+                st.error("パスワードが違います。")
+    st.stop()
+
 autoload()
 
 
@@ -209,7 +237,7 @@ def set_text(key, text, term, ident, tone):
 
 def cb_generate():
     ss = st.session_state
-    api_key, ident = ss.get("api_key", "").strip(), get_ident()
+    api_key, ident = resolve_api_key(), get_ident()
     if not api_key:
         ss["flash"] = ("error", "サイドバーにAnthropic APIキーを入力してください。")
         return
@@ -232,7 +260,7 @@ def cb_generate():
 def cb_adjust(direction):
     ss = st.session_state
     key = current_key()
-    api_key = ss.get("api_key", "").strip()
+    api_key = resolve_api_key()
     rec = ss["records"].get(key)
     if not api_key:
         ss["flash"] = ("error", "サイドバーにAnthropic APIキーを入力してください。")
@@ -287,11 +315,15 @@ def cb_delete():
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("⚙️ 設定")
-    st.text_input(
-        "Anthropic API Key", type="password", key="api_key", placeholder="sk-ant-...",
-        help="console.anthropic.com にログインし、「API Keys」で作成したキーをここに貼り付けます。"
-             "キーはこの画面のセッション内でのみ使われ、ファイルには保存されません。",
-    )
+    if get_secret("ANTHROPIC_API_KEY"):
+        st.success("🔑 APIキーは Secrets から読み込み済みです。入力は不要です。")
+    else:
+        st.text_input(
+            "Anthropic API Key", type="password", key="api_key", placeholder="sk-ant-...",
+            help="console.anthropic.com にログインし、「API Keys」で作成したキーをここに貼り付けます。"
+                 "キーはこの画面のセッション内でのみ使われ、ファイルには保存されません。"
+                 "（Secrets に ANTHROPIC_API_KEY を登録すると、入力が不要になります）",
+        )
     ident_mode = st.radio("児童の識別方法", ["出席番号 1〜50番", "イニシャル入力"], key="ident_mode")
     term = st.radio("対象学期", ["1学期", "2学期", "3学期"], horizontal=True, key="term_sel")
     st.slider("目標文字数", 80, 200, 120, step=5, key="target_sel")
@@ -325,7 +357,7 @@ st.caption("タグと3行メモから、学習指導要領の観点を踏まえ�
 
 if anthropic is None:
     st.error("anthropic ライブラリが見つかりません。`pip install anthropic` を実行して再起動してください。")
-if not st.session_state.get("api_key", "").strip():
+if not resolve_api_key():
     st.info("👈 まずサイドバーで Anthropic API Key を入力してください（iPadでは左上の「≫」から開けます）。")
 
 st.subheader("① 児童を選ぶ")
