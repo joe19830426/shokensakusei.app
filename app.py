@@ -444,16 +444,14 @@ def run_batch(df, api_key):
 
 
 with st.expander("👥 まとめて作成（複数人を一度に）", expanded=False):
-    st.caption("表に「識別子」と「特徴・メモ」を入力し、まとめて生成します。サイドバーの学期・文字数・トーンが全員に適用されます。"
+    st.caption("1人1行で「識別子：特徴・メモ」の形に入力し、まとめて生成します。サイドバーの学期・文字数・トーンが全員に適用されます。"
                "生成中は画面を閉じず、そのままお待ちください。")
-    if "batch_base" not in st.session_state:
-        st.session_state["batch_base"] = pd.DataFrame({"識別子": [""] * 5, "特徴・メモ": [""] * 5})
-    batch_df = st.data_editor(
-        st.session_state["batch_base"], key="batch_editor", num_rows="dynamic", use_container_width=True,
-        column_config={
-            "識別子": st.column_config.TextColumn("識別子（番号/イニシャル）", width="small"),
-            "特徴・メモ": st.column_config.TextColumn("特徴・メモ（場面・変容・周囲への影響など）", width="large"),
-        },
+    batch_text = st.text_area(
+        "1人1行で入力（識別子＋コロン＋メモ）", key="batch_text", height=220,
+        placeholder="1：係活動に熱心。周りの人が嫌がる仕事も進んで引き受ける\n"
+                    "2：算数で友達の考えを聞き、自分の式を直す。発表が増えた\n"
+                    "3：誰にでも優しく、班の話し合いを盛り上げる",
+        help="出席番号（またはイニシャル）のあとに「：」「:」「、」または空白を入れて、特徴・メモを書いてください。",
     )
     st.checkbox("すでに所見がある児童は上書きしない", value=True, key="batch_skip")
     if st.button("✨ まとめて生成する", use_container_width=True, key="batch_go"):
@@ -461,7 +459,13 @@ with st.expander("👥 まとめて作成（複数人を一度に）", expanded=
         if not _k:
             st.error("サイドバーにAnthropic APIキーを入力してください。")
         else:
-            run_batch(batch_df, _k)
+            _rows = []
+            for _line in batch_text.splitlines():
+                if not _line.strip():
+                    continue
+                _m = re.match(r"^\s*([A-Za-z0-9０-９.\-_・]+)\s*[:：,，、\s]\s*(.+)$", _line)
+                _rows.append((_m.group(1), _m.group(2)) if _m else ("", _line.strip()))
+            run_batch(pd.DataFrame(_rows, columns=["識別子", "特徴・メモ"]), _k)
 
 st.subheader("① 児童を選ぶ")
 if ident_mode == "出席番号 1〜50番":
