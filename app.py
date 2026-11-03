@@ -6,7 +6,9 @@
 import hmac
 import json
 import re
+import unicodedata
 from datetime import datetime
+import pandas as pd
 import streamlit as st
 
 try:
@@ -75,11 +77,16 @@ def call_claude(api_key: str, model: str, user_prompt: str) -> str:
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
         model=model,
-        max_tokens=1000,
+        max_tokens=4000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )
-    return clean_output("".join(b.text for b in resp.content if getattr(b, "type", "") == "text"))
+    text = clean_output("".join(b.text for b in resp.content if getattr(b, "type", "") == "text"))
+    if not text:
+        raise RuntimeError(
+            f"AIの応答が空でした（stop_reason={getattr(resp, 'stop_reason', '不明')}）。"
+            "もう一度お試しいただくか、詳細設定のモデル名をご確認ください。")
+    return text
 
 
 def friendly_error(e: Exception) -> str:
@@ -127,7 +134,10 @@ def generate_with_fix(api_key, model, prompt, target, max_fix=2):
             break
         hint = (f"{abs(diff)}字ほど削って短くしてください" if diff > 0
                 else f"{abs(diff)}字ほど加えて充実させてください")
-        text = call_claude(api_key, model, build_adjust_prompt(text, target, hint))
+        try:
+            text = call_claude(api_key, model, build_adjust_prompt(text, target, hint))
+        except RuntimeError:  # 調整の応答が空だった場合は、調整前の所見を残す
+            break
     return text
 
 
@@ -289,8 +299,22 @@ def cb_restore():
     if f is None:
         ss["flash"] = ("error", "復元するバックアップファイル（.json）を選んでください。")
         return
+    apply_backup(f.getvalue().decode("utf-8-sig", errors="replace"))
+
+
+def cb_restore_text():
+    ss = st.session_state
+    raw = ss.get("restore_text", "").strip()
+    if not raw:
+        ss["flash"] = ("error", "貼り付け欄にバックアップのテキストを入力してください。")
+        return
+    apply_backup(raw)
+
+
+def apply_backup(raw: str):
+    ss = st.session_state
     try:
-        data = json.loads(f.getvalue().decode("utf-8"))
+        data = json.loads(raw)
         recs = data["records"]
         n = 0
         for k, r in recs.items():
@@ -343,13 +367,19 @@ with st.sidebar:
         st.caption("※ 閲覧履歴やサイトデータを消去すると自動保存も消えます。大切なデータは下で書き出しておくと安心です。")
     n_all = len(st.session_state["records"])
     st.download_button(
-        f"バックアップを書き出す（{n_all}件）", data=backup_json(),
-        file_name=f"所見バックアップ_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-        mime="application/json", use_container_width=True, disabled=n_all == 0,
+        f"バックアップを書き出す（{n_all}件）", data=b"\xef\xbb\xbf" + backup_json(),
+        file_name=f"shoken_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+        mime="text/plain", use_container_width=True, disabled=n_all == 0,
         help="保存先に「Googleドライブ」を選べます。APIキーは含まれません。",
     )
-    st.file_uploader("バックアップを読み込む（.json）", type=["json"], key="restore_file")
+    st.file_uploader("バックアップを読み込む（.txt）", type=["txt", "json"], key="restore_file")
     st.button("📂 読み込んで復元", on_click=cb_restore, use_container_width=True)
+
+    with st.expander("ファイルが使えない場合：テキストでコピー＆貼り付け"):
+        st.caption("下のコードの右上のコピーボタンでコピーし、メモ等に貼って保管できます。復元するときは貼り付け欄に貼ってください。")
+        st.code(backup_json().decode("utf-8"), language="json")
+        st.text_area("復元用の貼り付け欄", key="restore_text", height=100)
+        st.button("📋 貼り付けた内容から復元", on_click=cb_restore_text, use_container_width=True)
 
 # ---------------------------------------------------------------- main
 st.title("📝 通知表 所見ドラフト作成")
@@ -359,6 +389,79 @@ if anthropic is None:
     st.error("anthropic ライブラリが見つかりません。`pip install anthropic` を実行して再起動してください。")
 if not resolve_api_key():
     st.info("👈 まずサイドバーで Anthropic API Key を入力してください（iPadでは左上の「≫」から開けます）。")
+
+def normalize_ident(raw, mode):
+    s = unicodedata.normalize("NFKC", "" if pd.isna(raw) else str(raw)).strip()
+    if mode.startswith("出席番号"):
+        return str(int(s)) if s.isdigit() and 1 <= int(s) <= 50 else None
+    return s if re.fullmatch(r"[A-Za-z0-9.\-_・]{1,8}", s) else None
+
+
+def run_batch(df, api_key):
+    ss = st.session_state
+    term_, tone_, target_ = ss["term_sel"], ss["tone_sel"], ss["target_sel"]
+    jobs, problems, seen = [], [], set()
+    for i, row in df.iterrows():
+        raw_id, memo = row.get("識別子"), row.get("特徴・メモ")
+        memo = "" if pd.isna(memo) else str(memo).strip()
+        if (pd.isna(raw_id) or not str(raw_id).strip()) and not memo:
+            continue  # 空行は無視
+        ident_ = normalize_ident(raw_id, ident_mode)
+        if ident_ is None:
+            problems.append(f"{i + 1}行目：識別子「{'' if pd.isna(raw_id) else raw_id}」が正しくありません。")
+        elif not memo:
+            problems.append(f"{i + 1}行目（{ident_}）：特徴・メモが空のためスキップしました。")
+        elif ident_ in seen:
+            problems.append(f"{i + 1}行目（{ident_}）：識別子が重複しているためスキップしました。")
+        elif ss.get("batch_skip", True) and rec_key(term_, ident_) in ss["records"]:
+            problems.append(f"{ident_}：すでに所見があるためスキップしました。")
+        else:
+            seen.add(ident_)
+            jobs.append((ident_, memo))
+    if not jobs:
+        st.warning("作成できる行がありませんでした。")
+    else:
+        bar = st.progress(0.0, text="作成を始めます…")
+        done, errors = 0, []
+        for n, (ident_, memo) in enumerate(jobs):
+            bar.progress(n / len(jobs), text=f"{ident_} を作成中…（{n + 1}/{len(jobs)}）")
+            try:
+                prompt = build_generate_prompt(term_, tone_, target_, [], memo)
+                text = generate_with_fix(api_key, ss["model_name"], prompt, target_)
+                set_text(rec_key(term_, ident_), text, term_, ident_, tone_)
+                done += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{ident_}：{friendly_error(e)}")
+                if anthropic is not None and isinstance(e, anthropic.AuthenticationError):
+                    break
+        bar.progress(1.0, text="完了")
+        if done:
+            st.success(f"{term_}の所見を{done}名分作成しました。下の「④ 一括出力」で確認できます。")
+        for m in errors:
+            st.error(m)
+    for m in problems:
+        st.warning(m)
+
+
+with st.expander("👥 まとめて作成（複数人を一度に）", expanded=False):
+    st.caption("表に「識別子」と「特徴・メモ」を入力し、まとめて生成します。サイドバーの学期・文字数・トーンが全員に適用されます。"
+               "生成中は画面を閉じず、そのままお待ちください。")
+    if "batch_base" not in st.session_state:
+        st.session_state["batch_base"] = pd.DataFrame({"識別子": [""] * 5, "特徴・メモ": [""] * 5})
+    batch_df = st.data_editor(
+        st.session_state["batch_base"], key="batch_editor", num_rows="dynamic", use_container_width=True,
+        column_config={
+            "識別子": st.column_config.TextColumn("識別子（番号/イニシャル）", width="small"),
+            "特徴・メモ": st.column_config.TextColumn("特徴・メモ（場面・変容・周囲への影響など）", width="large"),
+        },
+    )
+    st.checkbox("すでに所見がある児童は上書きしない", value=True, key="batch_skip")
+    if st.button("✨ まとめて生成する", use_container_width=True, key="batch_go"):
+        _k = resolve_api_key()
+        if not _k:
+            st.error("サイドバーにAnthropic APIキーを入力してください。")
+        else:
+            run_batch(batch_df, _k)
 
 st.subheader("① 児童を選ぶ")
 if ident_mode == "出席番号 1〜50番":
@@ -457,8 +560,8 @@ else:
 
     txt_lines = [f"【{view_term}】"] + [f"{r['ident']}\t{r['text']}\t{count_chars(r['text'])}字" for r in rows]
     st.download_button(
-        "💾 .txt 一括ダウンロード", data="\n".join(txt_lines).encode("utf-8"),
-        file_name=f"所見_{view_term}.txt", mime="text/plain", use_container_width=True,
+        "💾 .txt 一括ダウンロード", data=b"\xef\xbb\xbf" + "\n".join(txt_lines).encode("utf-8"),
+        file_name=f"shoken_term{view_term[0]}.txt", mime="text/plain", use_container_width=True,
         help="保存先に「Googleドライブ」を選べます。",
     )
 
